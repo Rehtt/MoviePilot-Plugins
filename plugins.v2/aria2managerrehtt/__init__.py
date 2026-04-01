@@ -20,7 +20,7 @@ class Aria2ManagerRehtt(_PluginBase):
     # 插件图标（使用在线图标，避免仓库内额外资源依赖）
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/download.png"
     # 插件版本
-    plugin_version = "1.0"
+    plugin_version = "1.1"
     # 插件作者
     plugin_author = "Rehtt"
     # 作者主页
@@ -433,6 +433,93 @@ class Aria2ManagerRehtt(_PluginBase):
             return Path(base_dir)
         return Path("/")
 
+    @staticmethod
+    def _task_title(task: Dict[str, Any]) -> str:
+        gid = task.get("gid") or ""
+        bt = task.get("bittorrent", {}) or {}
+        info = bt.get("info", {}) or {}
+        if info.get("name"):
+            return info.get("name")
+        files = task.get("files") or []
+        if files and isinstance(files, list):
+            first = files[0] or {}
+            path = first.get("path")
+            if path:
+                return Path(path).name
+            uris = first.get("uris") or []
+            if uris and isinstance(uris, list):
+                uri = (uris[0] or {}).get("uri")
+                if uri:
+                    return Path(uri).name
+        return gid
+
+    def _task_progress(self, task: Dict[str, Any]) -> float:
+        total = self._to_int(task.get("totalLength"), 0)
+        completed = self._to_int(task.get("completedLength"), 0)
+        if total <= 0:
+            return 0
+        return round(completed * 100 / total, 2)
+
+    def _task_left_time(self, task: Dict[str, Any]) -> str:
+        total = self._to_int(task.get("totalLength"), 0)
+        completed = self._to_int(task.get("completedLength"), 0)
+        speed = self._to_int(task.get("downloadSpeed"), 0)
+        if speed <= 0 or completed >= total:
+            return ""
+        left_seconds = int((total - completed) / speed)
+        if left_seconds <= 0:
+            return ""
+        hours = left_seconds // 3600
+        minutes = (left_seconds % 3600) // 60
+        seconds = left_seconds % 60
+        if hours > 0:
+            return f"{hours}h{minutes}m{seconds}s"
+        if minutes > 0:
+            return f"{minutes}m{seconds}s"
+        return f"{seconds}s"
+
+    @staticmethod
+    def _task_state(status: str) -> str:
+        if status in ("paused",):
+            return "paused"
+        if status in ("active", "waiting"):
+            return "downloading"
+        if status in ("error", "removed"):
+            return "error"
+        if status == "complete":
+            return "completed"
+        return "downloading"
+
+    def _to_transfer_torrent(self, task: Dict[str, Any], downloader: Optional[str]) -> TransferTorrent:
+        return TransferTorrent(
+            downloader=downloader,
+            title=self._task_title(task),
+            path=self._task_path(task),
+            hash=task.get("gid"),
+            size=self._to_int(task.get("totalLength")),
+            tags="",
+            progress=self._task_progress(task),
+            state=self._task_state(task.get("status") or ""),
+        )
+
+    def _to_downloading_torrent(self, task: Dict[str, Any], downloader: Optional[str]) -> DownloadingTorrent:
+        title = self._task_title(task)
+        return DownloadingTorrent(
+            downloader=downloader,
+            hash=task.get("gid"),
+            title=title,
+            name=title,
+            year=None,
+            season_episode=None,
+            progress=self._task_progress(task),
+            size=self._to_int(task.get("totalLength")),
+            state=self._task_state(task.get("status") or ""),
+            dlspeed=str(self._to_int(task.get("downloadSpeed"))),
+            upspeed=str(self._to_int(task.get("uploadSpeed"))),
+            tags=None,
+            left_time=self._task_left_time(task),
+        )
+
     def download(
         self,
         content: Any,
@@ -496,17 +583,7 @@ class Aria2ManagerRehtt(_PluginBase):
                 for gid in gids:
                     t = self._rpc_call("aria2.tellStatus", [gid])
                     if t:
-                        results.append(
-                            TransferTorrent(
-                                downloader=downloader,
-                                title=t.get("bittorrent", {}).get("info", {}).get("name") or gid,
-                                path=self._task_path(t),
-                                hash=gid,
-                                size=self._to_int(t.get("totalLength")),
-                                progress=(self._to_int(t.get("completedLength")) / max(self._to_int(t.get("totalLength"), 1), 1)) * 100,
-                                state="paused" if t.get("status") == "paused" else "downloading",
-                            )
-                        )
+                        results.append(self._to_transfer_torrent(t, downloader))
                 return results
 
             if status == TorrentStatus.DOWNLOADING:
@@ -515,45 +592,17 @@ class Aria2ManagerRehtt(_PluginBase):
                 tasks = (active or []) + (waiting or [])
                 ret = []
                 for t in tasks:
-                    total = self._to_int(t.get("totalLength"), 1)
-                    completed = self._to_int(t.get("completedLength"), 0)
-                    ret.append(
-                        DownloadingTorrent(
-                            downloader=downloader,
-                            hash=t.get("gid"),
-                            title=t.get("bittorrent", {}).get("info", {}).get("name") or t.get("gid"),
-                            name=t.get("bittorrent", {}).get("info", {}).get("name") or t.get("gid"),
-                            year=None,
-                            season_episode=None,
-                            progress=(completed / max(total, 1)) * 100,
-                            size=total,
-                            state="paused" if t.get("status") == "paused" else "downloading",
-                            dlspeed=str(self._to_int(t.get("downloadSpeed"))),
-                            upspeed=str(self._to_int(t.get("uploadSpeed"))),
-                            tags=None,
-                            left_time="",
-                        )
-                    )
+                    ret.append(self._to_downloading_torrent(t, downloader))
                 return ret
 
             if status == TorrentStatus.TRANSFER:
                 stopped = self._rpc_call("aria2.tellStopped", [0, 200]) or []
                 ret = []
                 for t in stopped:
-                    if t.get("status") != "complete":
+                    # 仅返回“可转移”的完成任务
+                    if (t.get("status") or "") != "complete":
                         continue
-                    gid = t.get("gid")
-                    ret.append(
-                        TransferTorrent(
-                            downloader=downloader,
-                            title=t.get("bittorrent", {}).get("info", {}).get("name") or gid,
-                            path=self._task_path(t),
-                            hash=gid,
-                            tags="",
-                            progress=100,
-                            state="downloading",
-                        )
-                    )
+                    ret.append(self._to_transfer_torrent(t, downloader))
                 return ret
             return None
         except Exception as err:
@@ -647,17 +696,26 @@ class Aria2ManagerRehtt(_PluginBase):
 
     def refresh_status(self) -> Dict[str, Any]:
         try:
-            active = self._rpc_call("aria2.getGlobalStat")
+            stat = self._rpc_call("aria2.getGlobalStat")
             waiting = self._rpc_call("aria2.tellWaiting", [0, 1000])
             stopped = self._rpc_call("aria2.tellStopped", [0, 1000])
             active_tasks = self._rpc_call("aria2.tellActive")
+            stopped_error = 0
+            stopped_complete = 0
+            for t in stopped or []:
+                if t.get("status") == "error":
+                    stopped_error += 1
+                elif t.get("status") == "complete":
+                    stopped_complete += 1
             status = {
                 "connection": "ok",
-                "active": len(active_tasks) if isinstance(active_tasks, list) else 0,
-                "waiting": len(waiting) if isinstance(waiting, list) else 0,
-                "stopped": len(stopped) if isinstance(stopped, list) else 0,
-                "download_speed": int(active.get("downloadSpeed", 0)),
-                "upload_speed": int(active.get("uploadSpeed", 0)),
+                "active": self._to_int(stat.get("numActive"), len(active_tasks) if isinstance(active_tasks, list) else 0),
+                "waiting": self._to_int(stat.get("numWaiting"), len(waiting) if isinstance(waiting, list) else 0),
+                "stopped": self._to_int(stat.get("numStopped"), len(stopped) if isinstance(stopped, list) else 0),
+                "stopped_complete": stopped_complete,
+                "stopped_error": stopped_error,
+                "download_speed": self._to_int(stat.get("downloadSpeed", 0)),
+                "upload_speed": self._to_int(stat.get("uploadSpeed", 0)),
             }
             self._last_status = status
             self._last_error = ""
