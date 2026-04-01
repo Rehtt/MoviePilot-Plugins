@@ -1,0 +1,14 @@
+{
+  "Aria2ManagerRehtt": {
+    "name": "Aria2 下载管理",
+    "description": "在 MoviePilot 下载管理中实现对 Aria2 的控制与监控。",
+    "labels": "下载管理,aria2",
+    "version": "1.0",
+    "icon": "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/download.png",
+    "author": "Rehtt",
+    "level": 1,
+    "history": {
+      "v1.0": "初版：支持 Aria2 状态监控、远程命令控制、API 与定时巡检。"
+    }
+  }
+}
