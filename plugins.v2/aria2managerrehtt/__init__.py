@@ -410,6 +410,12 @@ class Aria2ManagerRehtt(_PluginBase):
 
     def _is_target_downloader(self, downloader: Optional[str]) -> bool:
         helper = DownloaderHelper()
+        # MoviePilot 在不同场景下，可能会传入“下载器服务名”（name）或直接传入“下载器类型”（type）。
+        # 这里同时兼容两种输入，避免因为识别失败导致 download 返回 None，从而影响通用下载管理页的入口显示/功能可用性。
+        target_type = self._target_type()
+        if downloader and str(downloader).strip().lower() == target_type:
+            return True
+
         service = helper.get_service(name=downloader) if downloader else None
         if service and service.type:
             return str(service.type).lower() == self._target_type()
