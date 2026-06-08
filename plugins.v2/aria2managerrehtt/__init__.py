@@ -1,15 +1,31 @@
 import json
 import urllib.request
+import urllib.parse
 import base64
+import os
 from pathlib import Path
 from typing import List, Tuple, Dict, Any, Optional
 
 from app.core.event import eventmanager, Event
+from app.core.metainfo import MetaInfo
 from app.helper.downloader import DownloaderHelper
 from app.log import logger
 from app.plugins import _PluginBase
 from app.schemas import NotificationType, TransferTorrent, DownloadingTorrent, DownloaderInfo
 from app.schemas.types import EventType, TorrentStatus
+from app.utils.string import StringUtils
+
+
+class Aria2File(dict):
+    """
+    Dict with attribute access, matching the access patterns MoviePilot uses for downloader files.
+    """
+
+    def __getattr__(self, item):
+        try:
+            return self[item]
+        except KeyError as err:
+            raise AttributeError(item) from err
 
 
 class Aria2ManagerRehtt(_PluginBase):
@@ -20,7 +36,7 @@ class Aria2ManagerRehtt(_PluginBase):
     # 插件图标（使用在线图标，避免仓库内额外资源依赖）
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/download.png"
     # 插件版本
-    plugin_version = "1.1"
+    plugin_version = "1.2"
     # 插件作者
     plugin_author = "Rehtt"
     # 作者主页
@@ -41,6 +57,20 @@ class Aria2ManagerRehtt(_PluginBase):
     _downloader_type: str = "aria2managerrehtt"
     _last_status: Dict[str, Any] = {}
     _last_error: str = ""
+    _task_data_key: str = "tasks"
+    _done_tag: str = "已整理"
+    _status_fields: List[str] = [
+        "gid",
+        "status",
+        "totalLength",
+        "completedLength",
+        "downloadSpeed",
+        "uploadSpeed",
+        "dir",
+        "files",
+        "bittorrent",
+        "errorMessage",
+    ]
 
     def init_plugin(self, config: dict = None):
         if config:
@@ -371,7 +401,7 @@ class Aria2ManagerRehtt(_PluginBase):
                 text=f"监控异常：{self._last_error or 'Aria2 不可达'}",
             )
 
-    def _rpc_call(self, method: str, params: Optional[List[Any]] = None) -> Dict[str, Any]:
+    def _rpc_call(self, method: str, params: Optional[List[Any]] = None) -> Any:
         payload: Dict[str, Any] = {
             "jsonrpc": "2.0",
             "id": "moviepilot-aria2",
@@ -398,6 +428,14 @@ class Aria2ManagerRehtt(_PluginBase):
                 raise RuntimeError(str(parsed.get("error")))
             return parsed.get("result", {})
 
+    def _rpc_ignore_error(self, method: str, params: Optional[List[Any]] = None) -> bool:
+        try:
+            self._rpc_call(method, params)
+            return True
+        except Exception as err:
+            logger.debug(f"Aria2 RPC 忽略错误 {method}: {err}")
+            return False
+
     @staticmethod
     def _to_int(value: Any, default: int = 0) -> int:
         try:
@@ -405,10 +443,102 @@ class Aria2ManagerRehtt(_PluginBase):
         except Exception:
             return default
 
+    @staticmethod
+    def _to_bool(value: Any) -> bool:
+        if isinstance(value, bool):
+            return value
+        return str(value).lower() in ("true", "1", "yes", "y")
+
+    @staticmethod
+    def _as_list(value: Any) -> List[Any]:
+        if value is None:
+            return []
+        if isinstance(value, list):
+            return value
+        if isinstance(value, tuple) or isinstance(value, set):
+            return list(value)
+        return [value]
+
+    @staticmethod
+    def _unique(values: List[Any]) -> List[Any]:
+        ret = []
+        for value in values:
+            if value is None:
+                continue
+            text = str(value).strip()
+            if text and text not in ret:
+                ret.append(text)
+        return ret
+
+    @staticmethod
+    def _str_filesize(value: Any) -> str:
+        try:
+            return StringUtils.str_filesize(int(value or 0))
+        except Exception:
+            return str(value or 0)
+
+    def _load_task_meta(self) -> Dict[str, Dict[str, Any]]:
+        try:
+            data = self.get_data(self._task_data_key) or {}
+            return data if isinstance(data, dict) else {}
+        except Exception as err:
+            logger.debug(f"读取 Aria2 任务元数据失败：{err}")
+            return {}
+
+    def _save_task_meta(self, data: Dict[str, Dict[str, Any]]) -> None:
+        try:
+            self.save_data(self._task_data_key, data or {})
+        except Exception as err:
+            logger.debug(f"保存 Aria2 任务元数据失败：{err}")
+
+    def _get_task_meta(self, gid: Optional[str]) -> Dict[str, Any]:
+        if not gid:
+            return {}
+        return self._load_task_meta().get(str(gid), {}) or {}
+
+    def _update_task_meta(self, gid: Optional[str], **kwargs) -> None:
+        if not gid:
+            return
+        data = self._load_task_meta()
+        gid = str(gid)
+        current = data.get(gid, {}) or {}
+        tags = self._unique(self._as_list(current.get("tags")) + self._as_list(kwargs.pop("tags", [])))
+        current.update(kwargs)
+        if tags:
+            current["tags"] = tags
+        data[gid] = current
+        self._save_task_meta(data)
+
+    def _remove_task_meta(self, gid: Optional[str]) -> None:
+        if not gid:
+            return
+        data = self._load_task_meta()
+        if data.pop(str(gid), None) is not None:
+            self._save_task_meta(data)
+
+    def _resolve_downloader_name(self, downloader: Optional[str] = None) -> Optional[str]:
+        if downloader:
+            return downloader
+        helper = DownloaderHelper()
+        configs = helper.get_configs()
+        target_type = self._target_type()
+        for name, conf in configs.items():
+            if conf.default and str(conf.type).lower() == target_type:
+                return name
+        for name, conf in configs.items():
+            if str(conf.type).lower() == target_type:
+                return name
+        return downloader or target_type
+
+    def _tell_status(self, gid: str, fields: Optional[List[str]] = None) -> Dict[str, Any]:
+        if fields:
+            return self._rpc_call("aria2.tellStatus", [gid, fields]) or {}
+        return self._rpc_call("aria2.tellStatus", [gid, self._status_fields]) or {}
+
     def _target_type(self) -> str:
         return (self._downloader_type or "aria2managerrehtt").lower()
 
-    def _is_target_downloader(self, downloader: Optional[str]) -> bool:
+    def _is_target_downloader(self, downloader: Optional[str], default_only_when_empty: bool = True) -> bool:
         helper = DownloaderHelper()
         # MoviePilot 在不同场景下，可能会传入“下载器服务名”（name）或直接传入“下载器类型”（type）。
         # 这里同时兼容两种输入，避免因为识别失败导致 download 返回 None，从而影响通用下载管理页的入口显示/功能可用性。
@@ -422,19 +552,32 @@ class Aria2ManagerRehtt(_PluginBase):
         if not downloader:
             configs = helper.get_configs()
             for conf in configs.values():
-                if conf.default:
+                if default_only_when_empty and conf.default:
                     return str(conf.type).lower() == self._target_type()
+                if not default_only_when_empty and str(conf.type).lower() == self._target_type():
+                    return True
         return False
 
-    @staticmethod
-    def _task_path(task: Dict[str, Any]) -> Path:
+    def _task_path(self, task: Dict[str, Any]) -> Path:
         base_dir = task.get("dir") or ""
         files = task.get("files") or []
+        bt = task.get("bittorrent", {}) or {}
+        info = bt.get("info", {}) or {}
+        info_name = info.get("name")
+
+        if base_dir and info_name:
+            return Path(base_dir) / info_name
+
         if files and isinstance(files, list):
-            first = files[0] or {}
-            fpath = first.get("path")
-            if fpath:
-                return Path(fpath)
+            paths = [Path(file.get("path")) for file in files if file and file.get("path")]
+            if len(paths) == 1:
+                return paths[0]
+            if len(paths) > 1:
+                try:
+                    common = Path(os.path.commonpath([path.as_posix() for path in paths]))
+                    return common
+                except Exception:
+                    return paths[0].parent
         if base_dir:
             return Path(base_dir)
         return Path("/")
@@ -456,8 +599,61 @@ class Aria2ManagerRehtt(_PluginBase):
             if uris and isinstance(uris, list):
                 uri = (uris[0] or {}).get("uri")
                 if uri:
-                    return Path(uri).name
+                    parsed = urllib.parse.urlparse(uri)
+                    return urllib.parse.unquote(Path(parsed.path or uri).name)
         return gid
+
+    def _task_tags(self, task: Dict[str, Any]) -> str:
+        meta = self._get_task_meta(task.get("gid"))
+        return ",".join(self._unique(self._as_list(meta.get("tags"))))
+
+    def _task_done(self, task: Dict[str, Any]) -> bool:
+        meta = self._get_task_meta(task.get("gid"))
+        tags = self._as_list(meta.get("tags"))
+        return bool(meta.get("done")) or self._done_tag in tags
+
+    def _task_files_root(self, task: Dict[str, Any]) -> Path:
+        task_path = self._task_path(task)
+        files = task.get("files") or []
+        if len(files) <= 1:
+            return task_path.parent if task_path.suffix else task_path.parent
+        return task_path.parent
+
+    def _to_file_entries(self, task: Dict[str, Any]) -> List[Aria2File]:
+        files = task.get("files") or []
+        if not isinstance(files, list):
+            return []
+        base = self._task_files_root(task)
+        ret: List[Aria2File] = []
+        for idx, file in enumerate(files, start=1):
+            if not file:
+                continue
+            absolute_path = Path(file.get("path") or "")
+            index = self._to_int(file.get("index"), idx)
+            size = self._to_int(file.get("length"), 0)
+            completed = self._to_int(file.get("completedLength"), 0)
+            selected = self._to_bool(file.get("selected", True))
+            try:
+                name = absolute_path.relative_to(base).as_posix()
+            except Exception:
+                name = absolute_path.name
+            progress = round(completed * 100 / size, 2) if size > 0 else 0
+            ret.append(
+                Aria2File(
+                    {
+                        "id": index,
+                        "index": index,
+                        "name": name,
+                        "path": absolute_path.as_posix(),
+                        "size": size,
+                        "completed": completed,
+                        "priority": 1 if selected else 0,
+                        "progress": progress,
+                        "selected": selected,
+                    }
+                )
+            )
+        return ret
 
     def _task_progress(self, task: Dict[str, Any]) -> float:
         total = self._to_int(task.get("totalLength"), 0)
@@ -497,34 +693,100 @@ class Aria2ManagerRehtt(_PluginBase):
         return "downloading"
 
     def _to_transfer_torrent(self, task: Dict[str, Any], downloader: Optional[str]) -> TransferTorrent:
+        downloader_name = self._resolve_downloader_name(downloader)
         return TransferTorrent(
-            downloader=downloader,
+            downloader=downloader_name,
             title=self._task_title(task),
             path=self._task_path(task),
             hash=task.get("gid"),
             size=self._to_int(task.get("totalLength")),
-            tags="",
+            tags=self._task_tags(task),
             progress=self._task_progress(task),
             state=self._task_state(task.get("status") or ""),
         )
 
     def _to_downloading_torrent(self, task: Dict[str, Any], downloader: Optional[str]) -> DownloadingTorrent:
+        downloader_name = self._resolve_downloader_name(downloader)
         title = self._task_title(task)
+        meta = MetaInfo(title)
         return DownloadingTorrent(
-            downloader=downloader,
+            downloader=downloader_name,
             hash=task.get("gid"),
             title=title,
-            name=title,
-            year=None,
-            season_episode=None,
+            name=meta.name or title,
+            year=meta.year,
+            season_episode=meta.season_episode,
             progress=self._task_progress(task),
             size=self._to_int(task.get("totalLength")),
             state=self._task_state(task.get("status") or ""),
-            dlspeed=str(self._to_int(task.get("downloadSpeed"))),
-            upspeed=str(self._to_int(task.get("uploadSpeed"))),
-            tags=None,
+            dlspeed=self._str_filesize(task.get("downloadSpeed")),
+            upspeed=self._str_filesize(task.get("uploadSpeed")),
+            tags=self._task_tags(task),
             left_time=self._task_left_time(task),
         )
+
+    @staticmethod
+    def _is_magnet(content: Any) -> bool:
+        if isinstance(content, bytes):
+            return content.startswith(b"magnet:")
+        if isinstance(content, str):
+            return content.startswith("magnet:")
+        return False
+
+    @staticmethod
+    def _is_http_url(content: Any) -> bool:
+        return isinstance(content, str) and (content.startswith("http://") or content.startswith("https://"))
+
+    def _build_add_options(self, download_dir: Path, cookie: str = "", pause: bool = False) -> Dict[str, Any]:
+        options: Dict[str, Any] = {"dir": str(download_dir)}
+        if pause:
+            options["pause"] = "true"
+        if cookie:
+            options["header"] = [f"Cookie: {cookie}"]
+        return options
+
+    def _record_added_task(
+        self,
+        gid: str,
+        downloader: Optional[str],
+        category: Optional[str] = None,
+        label: Optional[str] = None,
+        episodes: Optional[set] = None,
+        selected_episodes: Optional[List[int]] = None,
+    ) -> None:
+        tags = []
+        if label:
+            tags.extend([tag.strip() for tag in str(label).split(",")])
+        self._update_task_meta(
+            gid,
+            downloader=self._resolve_downloader_name(downloader),
+            category=category,
+            tags=tags,
+            episodes=sorted(list(episodes or [])),
+            selected_episodes=selected_episodes or [],
+            done=False,
+        )
+
+    def _select_episode_files(self, gid: str, episodes: set) -> Tuple[bool, str, List[int]]:
+        task = self._tell_status(gid, ["gid", "dir", "files", "bittorrent"])
+        files = self._to_file_entries(task)
+        if not files:
+            return False, "获取种子文件失败，无法选择集数", []
+
+        selected_indices = []
+        selected_episodes = []
+        for file in files:
+            meta = MetaInfo(Path(file.name).stem)
+            episode_list = set(meta.episode_list or [])
+            if episode_list and episode_list.issubset(episodes):
+                selected_indices.append(str(file.index))
+                selected_episodes.extend(list(episode_list))
+
+        if not selected_indices:
+            return False, "未匹配到需要下载的集数文件", []
+
+        self._rpc_call("aria2.changeOption", [gid, {"select-file": ",".join(selected_indices)}])
+        return True, f"已选择集数：{sorted(set(selected_episodes))}", sorted(set(selected_episodes))
 
     def download(
         self,
@@ -538,17 +800,16 @@ class Aria2ManagerRehtt(_PluginBase):
     ) -> Optional[Tuple[Optional[str], Optional[str], Optional[str], str]]:
         if not self._enabled or not self._is_target_downloader(downloader):
             return None
+        downloader_name = self._resolve_downloader_name(downloader)
         try:
-            options: Dict[str, Any] = {"dir": str(download_dir)}
-            if category:
-                options["dir"] = str(download_dir / category)
-            if label:
-                options["gid"] = None
-
+            select_episodes = bool(episodes) and not self._is_magnet(content) and not self._is_http_url(content)
+            options = self._build_add_options(download_dir=download_dir, pause=select_episodes)
             gid: Optional[str] = None
+            magnet_with_episodes = bool(episodes) and self._is_magnet(content)
+
             if isinstance(content, Path):
                 if not content.exists():
-                    return downloader, None, "Original", "种子文件不存在"
+                    return downloader_name, None, "Original", "种子文件不存在"
                 b64 = base64.b64encode(content.read_bytes()).decode("utf-8")
                 gid = self._rpc_call("aria2.addTorrent", [b64, [], options])
             elif isinstance(content, bytes):
@@ -559,20 +820,45 @@ class Aria2ManagerRehtt(_PluginBase):
                     b64 = base64.b64encode(content).decode("utf-8")
                     gid = self._rpc_call("aria2.addTorrent", [b64, [], options])
             elif isinstance(content, str):
-                if content.startswith("magnet:") or content.startswith("http://") or content.startswith("https://"):
+                if content.startswith("magnet:"):
                     gid = self._rpc_call("aria2.addUri", [[content], options])
+                elif content.startswith("http://") or content.startswith("https://"):
+                    http_options = self._build_add_options(download_dir=download_dir, cookie=cookie)
+                    gid = self._rpc_call("aria2.addUri", [[content], http_options])
                 else:
-                    return downloader, None, "Original", "不支持的下载内容格式"
+                    return downloader_name, None, "Original", "不支持的下载内容格式"
             else:
-                return downloader, None, "Original", "不支持的下载内容类型"
+                return downloader_name, None, "Original", "不支持的下载内容类型"
 
             if not gid:
-                return downloader, None, "Original", "添加下载失败"
-            return downloader, gid, "Original", "添加下载任务成功"
+                return downloader_name, None, "Original", "添加下载失败"
+
+            selected_episodes: List[int] = []
+            message = "添加下载任务成功"
+            if select_episodes:
+                selected, select_message, selected_episodes = self._select_episode_files(gid, episodes)
+                if not selected:
+                    self._rpc_ignore_error("aria2.remove", [gid])
+                    self._rpc_ignore_error("aria2.removeDownloadResult", [gid])
+                    return downloader_name, None, "Original", select_message
+                self._rpc_call("aria2.unpause", [gid])
+                message = f"添加下载任务成功，{select_message}"
+            elif magnet_with_episodes:
+                message = "添加下载任务成功；磁力链无法预读取文件列表，已按全集下载"
+
+            self._record_added_task(
+                gid=gid,
+                downloader=downloader_name,
+                category=category,
+                label=label,
+                episodes=episodes,
+                selected_episodes=selected_episodes,
+            )
+            return downloader_name, gid, "Original", message
         except Exception as err:
             self._last_error = str(err)
             logger.error(f"Aria2 添加下载失败：{self._last_error}")
-            return downloader, None, "Original", f"添加下载失败：{self._last_error}"
+            return downloader_name, None, "Original", f"添加下载失败：{self._last_error}"
 
     def list_torrents(
         self,
@@ -580,16 +866,20 @@ class Aria2ManagerRehtt(_PluginBase):
         hashs: Any = None,
         downloader: Optional[str] = None,
     ) -> Optional[List[Any]]:
-        if not self._enabled or not self._is_target_downloader(downloader):
+        if not self._enabled or not self._is_target_downloader(downloader, default_only_when_empty=False):
             return None
         try:
             if hashs:
                 gids = hashs if isinstance(hashs, list) else [hashs]
                 results = []
                 for gid in gids:
-                    t = self._rpc_call("aria2.tellStatus", [gid])
-                    if t:
-                        results.append(self._to_transfer_torrent(t, downloader))
+                    try:
+                        task = self._tell_status(str(gid))
+                    except Exception as err:
+                        logger.debug(f"Aria2 查询任务 {gid} 失败：{err}")
+                        continue
+                    if task:
+                        results.append(self._to_transfer_torrent(task, downloader))
                 return results
 
             if status == TorrentStatus.DOWNLOADING:
@@ -608,6 +898,8 @@ class Aria2ManagerRehtt(_PluginBase):
                     # 仅返回“可转移”的完成任务
                     if (t.get("status") or "") != "complete":
                         continue
+                    if self._task_done(t):
+                        continue
                     ret.append(self._to_transfer_torrent(t, downloader))
                 return ret
             return None
@@ -616,9 +908,59 @@ class Aria2ManagerRehtt(_PluginBase):
             logger.error(f"Aria2 查询任务失败：{self._last_error}")
             return None
 
-    def transfer_completed(self, hashs: str, downloader: Optional[str] = None) -> None:
-        # aria2 默认无标签体系，转移完成无需动作
+    def transfer_completed(self, hashs: Any, downloader: Optional[str] = None) -> None:
+        if not self._enabled or not self._is_target_downloader(downloader):
+            return None
+        for gid in self._as_list(hashs):
+            meta = self._get_task_meta(str(gid))
+            tags = self._unique(self._as_list(meta.get("tags")) + [self._done_tag])
+            self._update_task_meta(str(gid), tags=tags, done=True)
         return None
+
+    @staticmethod
+    def _unlink_file(path: Path) -> bool:
+        try:
+            if path.exists() and (path.is_file() or path.is_symlink()):
+                path.unlink()
+                return True
+        except Exception as err:
+            logger.warn(f"删除文件失败 {path}: {err}")
+        return False
+
+    @staticmethod
+    def _remove_empty_dirs(start: Path, stop: Path) -> None:
+        current = start
+        while current and current != stop and current.exists():
+            try:
+                current.rmdir()
+            except Exception:
+                break
+            current = current.parent
+
+    def _delete_task_files(self, task: Dict[str, Any]) -> None:
+        entries = self._to_file_entries(task)
+        task_path = self._task_path(task)
+        cleanup_stop = task_path.parent
+        parent_dirs = []
+
+        for entry in entries:
+            path = Path(entry.path)
+            self._unlink_file(path)
+            self._unlink_file(Path(f"{path}.aria2"))
+            parent_dirs.append(path.parent)
+
+        self._unlink_file(Path(f"{task_path}.aria2"))
+        for parent in sorted(set(parent_dirs), key=lambda item: len(item.parts), reverse=True):
+            self._remove_empty_dirs(parent, cleanup_stop)
+
+    def _remove_task_from_aria2(self, gid: str, task: Dict[str, Any]) -> None:
+        status = task.get("status") if task else ""
+        if status in ("active", "waiting", "paused"):
+            self._rpc_ignore_error("aria2.remove", [gid])
+            self._rpc_ignore_error("aria2.removeDownloadResult", [gid])
+            return
+        if not self._rpc_ignore_error("aria2.removeDownloadResult", [gid]):
+            self._rpc_ignore_error("aria2.remove", [gid])
 
     def remove_torrents(
         self,
@@ -631,8 +973,16 @@ class Aria2ManagerRehtt(_PluginBase):
         try:
             gids = hashs if isinstance(hashs, list) else [hashs]
             for gid in gids:
-                method = "aria2.removeDownloadResult" if delete_file else "aria2.remove"
-                self._rpc_call(method, [gid])
+                gid = str(gid)
+                try:
+                    task = self._tell_status(gid)
+                except Exception as err:
+                    logger.debug(f"Aria2 删除前查询任务 {gid} 失败：{err}")
+                    task = {}
+                self._remove_task_from_aria2(gid, task)
+                if delete_file and task:
+                    self._delete_task_files(task)
+                self._remove_task_meta(gid)
             return True
         except Exception as err:
             self._last_error = str(err)
@@ -642,7 +992,10 @@ class Aria2ManagerRehtt(_PluginBase):
     def set_torrents_tag(self, hashs: Any, tags: list, downloader: Optional[str] = None) -> Optional[bool]:
         if not self._enabled or not self._is_target_downloader(downloader):
             return None
-        # aria2 无原生标签体系，返回 True 以兼容链路调用
+        for gid in self._as_list(hashs):
+            current = self._get_task_meta(str(gid))
+            merged = self._unique(self._as_list(current.get("tags")) + self._as_list(tags))
+            self._update_task_meta(str(gid), tags=merged)
         return True
 
     def start_torrents(self, hashs: Any, downloader: Optional[str] = None) -> Optional[bool]:
@@ -671,19 +1024,19 @@ class Aria2ManagerRehtt(_PluginBase):
             logger.error(f"Aria2 暂停任务失败：{self._last_error}")
             return False
 
-    def torrent_files(self, tid: str, downloader: Optional[str] = None) -> Optional[List[Dict[str, Any]]]:
+    def torrent_files(self, tid: str, downloader: Optional[str] = None) -> Optional[List[Aria2File]]:
         if not self._enabled or not self._is_target_downloader(downloader):
             return None
         try:
-            status = self._rpc_call("aria2.tellStatus", [tid, ["files"]]) or {}
-            return status.get("files") or []
+            status = self._tell_status(tid, ["gid", "dir", "files", "bittorrent"])
+            return self._to_file_entries(status)
         except Exception as err:
             self._last_error = str(err)
             logger.error(f"Aria2 获取任务文件失败：{self._last_error}")
             return None
 
     def downloader_info(self, downloader: Optional[str] = None) -> Optional[List[DownloaderInfo]]:
-        if not self._enabled or not self._is_target_downloader(downloader):
+        if not self._enabled or not self._is_target_downloader(downloader, default_only_when_empty=False):
             return None
         try:
             stat = self._rpc_call("aria2.getGlobalStat") or {}
