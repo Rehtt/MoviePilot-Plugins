@@ -1,13 +1,15 @@
 {
   "Aria2ManagerRehtt": {
     "name": "Aria2 下载管理",
-    "description": "在 MoviePilot 下载管理中实现对 Aria2 的控制与监控。",
+    "description": "将单个 Aria2 RPC 实例接入 MoviePilot 下载、整理与任务管理。",
     "labels": "下载管理,aria2",
-    "version": "1.2",
+    "version": "1.3.0",
     "icon": "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/download.png",
     "author": "Rehtt",
     "level": 1,
+    "system_version": ">=2.15.1,<3",
     "history": {
+      "v1.3.0": "按 MoviePilot v2 当前下载器契约重构：拆分 RPC、配置、任务存储和路径安全模块，新增 infoHash/父子GID映射、原子数据迁移、全量分页、完整任务控制与严格白名单删除。",
       "v1.2": "补全 MoviePilot 下载器闭环：支持选集下载、整理去重、文件列表适配与删除实际下载文件。",
       "v1.1": "增强为自定义下载器模块：支持下载链路劫持与更完整任务状态映射。",
       "v1.0": "初版：支持 Aria2 状态监控、远程命令控制、API 与定时巡检。"
